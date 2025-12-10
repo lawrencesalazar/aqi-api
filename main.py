@@ -5,7 +5,7 @@ import psutil
 import os
 import math
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import firebase_admin
@@ -14,13 +14,13 @@ import pandas as pd
 import numpy as np
 import shap
 import xgboost as xgb  
-# from sklearn.linear_model import LinearRegression, LogisticRegression
-# from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-# from sklearn.tree import DecisionTreeRegressor
-# from sklearn.svm import SVR, SVC
-# from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR, SVC
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import  GridSearchCV, train_test_split, StratifiedKFold, RandomizedSearchCV
-# from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
 import matplotlib
@@ -32,7 +32,7 @@ import base64
 import logging 
 from typing import Dict, Any, Optional, List
 import matplotlib.gridspec as gridspec   
-
+from xgboost import XGBRegressor
 from io import BytesIO
 import shap
 from scipy import stats
@@ -43,26 +43,18 @@ import base64
 import joblib
 
 import requests   
-from collections import defaultdict
   
  
 # Configure logging FIRST
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global models and data storage (in-memory) with caching
+# Global models and data storage (in-memory)
 models = {}  # Store models by sensor_id: {sensor_id: model}
 data_cache = {}  # Store data by sensor_id: {sensor_id: data}
 training_metrics = {}  # Store training metrics by sensor_id
 shap_explainers = {}  # Store SHAP explainers by sensor_id
 firebase_db = None
-
-# Caching system
-model_cache = {}
-metadata_cache = {}
-history_cache = {}
-cache_expiry = {}  # Track cache expiry times
-CACHE_DURATION = 300  # 5 minutes cache
  
 # Set Seaborn style
 sns.set_style("whitegrid")
@@ -85,64 +77,6 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=3600,
 )
-
-# Simple Rate Limiter
-class SimpleRateLimiter:
-    def __init__(self):
-        self.requests = defaultdict(list)
-        self.limits = {
-            "/api/forecast/{sensor_id}": {"limit": 10, "window": 60},
-            "/api/live-predict/{sensor_id}": {"limit": 30, "window": 60},
-            "/api/xgboost/{sensor_id}": {"limit": 5, "window": 300},
-            "/api/report/{sensor_id}": {"limit": 3, "window": 300},
-            "/api/predict/{sensor_id}": {"limit": 20, "window": 60},
-            "/api/alerts/{sensor_id}": {"limit": 20, "window": 60},
-            "/api/alerts": {"limit": 20, "window": 60},
-            "/api/correlation_summary/{sensor_id}": {"limit": 15, "window": 60},
-            "/api/forecast/poll/{sensor_id}": {"limit": 60, "window": 60},
-        }
-    
-    def is_rate_limited(self, path: str, client_ip: str) -> bool:
-        """Check if client is rate limited for a specific path"""
-        if path not in self.limits:
-            return False
-        
-        limit_info = self.limits[path]
-        current_time = datetime.now()
-        
-        # Clean old requests
-        self.requests[client_ip] = [
-            req_time for req_time in self.requests[client_ip]
-            if (current_time - req_time).total_seconds() < limit_info["window"]
-        ]
-        
-        # Check if limit exceeded
-        if len(self.requests[client_ip]) >= limit_info["limit"]:
-            return True
-        
-        # Add current request
-        self.requests[client_ip].append(current_time)
-        return False
-    
-    def get_remaining(self, path: str, client_ip: str) -> int:
-        """Get remaining requests for a client"""
-        if path not in self.limits:
-            return 999
-        
-        limit_info = self.limits[path]
-        current_time = datetime.now()
-        
-        # Clean old requests
-        self.requests[client_ip] = [
-            req_time for req_time in self.requests[client_ip]
-            if (current_time - req_time).total_seconds() < limit_info["window"]
-        ]
-        
-        remaining = limit_info["limit"] - len(self.requests[client_ip])
-        return max(0, remaining)
-
-# Initialize rate limiter
-rate_limiter = SimpleRateLimiter()
 
 # Add specific CORS headers for SSE
 @app.middleware("http")
@@ -172,39 +106,6 @@ async def preflight_handler(request: Request, path: str):
             "Access-Control-Max-Age": "3600",
         }
     )
-
-# ---------------------------------------------------
-# Caching Functions
-# ---------------------------------------------------
-def get_cached_model(sensor_id):
-    """Get model from cache if not expired"""
-    if sensor_id in model_cache and sensor_id in cache_expiry:
-        if datetime.now() < cache_expiry[sensor_id].get('model', datetime.min):
-            logger.info(f"Using cached model for {sensor_id}")
-            return model_cache[sensor_id]
-    return None
-
-def cache_model(sensor_id, model):
-    """Cache model with expiry"""
-    model_cache[sensor_id] = model
-    if sensor_id not in cache_expiry:
-        cache_expiry[sensor_id] = {}
-    cache_expiry[sensor_id]['model'] = datetime.now() + timedelta(seconds=CACHE_DURATION)
-
-def get_cached_metadata(sensor_id):
-    """Get metadata from cache if not expired"""
-    if sensor_id in metadata_cache and sensor_id in cache_expiry:
-        if datetime.now() < cache_expiry[sensor_id].get('metadata', datetime.min):
-            logger.info(f"Using cached metadata for {sensor_id}")
-            return metadata_cache[sensor_id]
-    return None
-
-def cache_metadata(sensor_id, metadata):
-    """Cache metadata with expiry"""
-    metadata_cache[sensor_id] = metadata
-    if sensor_id not in cache_expiry:
-        cache_expiry[sensor_id] = {}
-    cache_expiry[sensor_id]['metadata'] = datetime.now() + timedelta(seconds=CACHE_DURATION)
 
 # ---------------------------------------------------
 # Improved Firebase Setup
@@ -815,7 +716,7 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
         # Get current thresholds
         thresholds = fetch_exposure_thresholds()
         
-        # Get recent sensor data with caching
+        # Get recent sensor data
         df = fetch_history(sensor_id, "1week")
         
         # Enhanced empty DataFrame check
@@ -975,77 +876,48 @@ def verify_thresholds_with_sensor_data(sensor_id: str):
                 "error_type": type(e).__name__
             }
         )      
-
 # ---------------------------------------------------
-# Optimized Data Fetching Function with Caching
+# Data Fetching Function with Fallback
 # ---------------------------------------------------
-def fetch_history(sensor_ID, range="1month", force_fresh=False):
-    """Fetch sensor history data from Firebase with caching"""
-    cache_key = f"{sensor_ID}_{range}"
-    
-    # Check cache first (unless forcing fresh data)
-    if not force_fresh and cache_key in history_cache and cache_key in cache_expiry:
-        if datetime.now() < cache_expiry[cache_key].get('history', datetime.min):
-            logger.info(f"Returning cached history for {sensor_ID} ({range})")
-            return history_cache[cache_key].copy()  # Return a copy to prevent mutation
-    
+def fetch_history(sensor_ID, range="1month"):
+    """Fetch sensor history data from Firebase with fallback"""
     try:
         if not firebase_db:
             logger.error("Firebase not initialized - cannot fetch data")
             return pd.DataFrame()
         
-        # Calculate date range to minimize data fetched
-        current_date = datetime.now()
-        if range == "1week":
-            start_date = current_date - timedelta(weeks=1)
-        elif range == "1month":
-            start_date = current_date - timedelta(days=30)
-        elif range == "3months":
-            start_date = current_date - timedelta(days=90)
-        elif range == "6months":
-            start_date = current_date - timedelta(days=180)
-        elif range == "1year":
-            start_date = current_date - timedelta(days=365)
-        else:
-            start_date = None
-        
         ref = db.reference(f'/history/{sensor_ID}')
-        
-        # Only order and limit if we have a start date
-        if start_date:
-            # Convert to timestamp for Firebase query
-            start_timestamp = int(start_date.timestamp() * 1000)
-            data = ref.order_by_child('timestamp').start_at(start_timestamp).get()
-        else:
-            data = ref.get()
+        data = ref.get()
         
         if not data:
             logger.warning(f"No data found for sensor {sensor_ID}")
-            df = pd.DataFrame()
-        else:
-            df = pd.DataFrame.from_dict(data, orient='index')
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', unit='ms')
+            return pd.DataFrame()
             
-            # Filter by date range to be safe
-            if start_date:
+        df = pd.DataFrame.from_dict(data, orient='index') 
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')     
+        
+        # Filter data based on the range parameter
+        if range != "all":
+            current_date = datetime.now()
+            
+            if range == "1week":
+                start_date = current_date - timedelta(weeks=1)
+            elif range == "1month":
+                start_date = current_date - timedelta(days=30)
+            elif range == "3months":
+                start_date = current_date - timedelta(days=90)
+            elif range == "6months":
+                start_date = current_date - timedelta(days=180)
+            elif range == "1year":
+                start_date = current_date - timedelta(days=365)
+            else:
+                start_date = df['timestamp'].min() if not df.empty else current_date
+            
+            # Filter the dataframe
+            if not df.empty:
                 df = df[df['timestamp'] >= start_date]
-        
-        # Cache the result
-        history_cache[cache_key] = df.copy()
-        if cache_key not in cache_expiry:
-            cache_expiry[cache_key] = {}
-        
-        # Cache duration based on range
-        if range == "1week":
-            cache_duration = 300  # 5 minutes for recent data
-        elif range == "1month":
-            cache_duration = 1800  # 30 minutes
-        else:
-            cache_duration = 3600  # 1 hour for older data
-            
-        cache_expiry[cache_key]['history'] = datetime.now() + timedelta(seconds=cache_duration)
-        
-        logger.info(f"Fetched {len(df)} records for sensor {sensor_ID} (cached for {cache_duration}s)")
+
+        logger.info(f"Fetched {len(df)} records for sensor {sensor_ID}")
         return df
         
     except Exception as e:
@@ -1053,7 +925,7 @@ def fetch_history(sensor_ID, range="1month", force_fresh=False):
         return pd.DataFrame()
 
 # ---------------------------------------------------
-# Model Management Functions with Caching
+# Model Management Functions
 # ---------------------------------------------------
 def save_model_to_firebase(model, sensor_ID, model_type="xgboost"):
     """
@@ -1080,10 +952,6 @@ def save_model_to_firebase(model, sensor_ID, model_type="xgboost"):
         
         ref.set(model_data)
         logger.info(f"Model saved to Firebase for sensor {sensor_ID}")
-        
-        # Update cache
-        cache_model(sensor_ID, model)
-        
         return f"firebase:/trained_models/{sensor_ID}"
         
     except Exception as e:
@@ -1092,14 +960,9 @@ def save_model_to_firebase(model, sensor_ID, model_type="xgboost"):
 
 def load_model_from_firebase(sensor_ID):
     """
-    Load trained model from Firebase with caching
+    Load trained model from Firebase
     """
     try:
-        # Check cache first
-        cached_model = get_cached_model(sensor_ID)
-        if cached_model:
-            return cached_model
-        
         if not firebase_db:
             logger.error("Firebase not initialized - cannot load model")
             return None
@@ -1115,9 +978,6 @@ def load_model_from_firebase(sensor_ID):
         model_b64 = model_data['model_data']
         model_bytes = base64.b64decode(model_b64)
         model = pickle.loads(model_bytes)
-        
-        # Cache the model
-        cache_model(sensor_ID, model)
         
         logger.info(f"Model loaded from Firebase for sensor {sensor_ID}")
         return model
@@ -1144,10 +1004,6 @@ def save_model_metadata(sensor_ID, metrics, feature_columns, best_params):
         }
         
         ref.set(metadata)
-        
-        # Update cache
-        cache_metadata(sensor_ID, metadata)
-        
         logger.info(f"Model metadata saved for sensor {sensor_ID}")
         return True
         
@@ -1157,25 +1013,14 @@ def save_model_metadata(sensor_ID, metrics, feature_columns, best_params):
 
 def load_model_metadata(sensor_ID):
     """
-    Load model metadata from Firebase with caching
+    Load model metadata from Firebase
     """
     try:
-        # Check cache first
-        cached_metadata = get_cached_metadata(sensor_ID)
-        if cached_metadata:
-            return cached_metadata
-        
         if not firebase_db:
             return None
         
         ref = db.reference(f'/model_metadata/{sensor_ID}')
-        metadata = ref.get()
-        
-        # Cache the metadata
-        if metadata:
-            cache_metadata(sensor_ID, metadata)
-        
-        return metadata
+        return ref.get()
         
     except Exception as e:
         logger.error(f"Error loading model metadata: {e}")
@@ -1186,10 +1031,6 @@ def model_exists_in_firebase(sensor_ID):
     Check if a trained model exists in Firebase
     """
     try:
-        # Check cache first
-        if get_cached_model(sensor_ID):
-            return True
-        
         if not firebase_db:
             return False
         
@@ -1217,10 +1058,6 @@ def delete_model_from_firebase(sensor_ID):
         metadata_ref = db.reference(f'/model_metadata/{sensor_ID}')
         metadata_ref.delete()
         
-        # Clear cache
-        model_cache.pop(sensor_ID, None)
-        metadata_cache.pop(sensor_ID, None)
-        
         logger.info(f"Model deleted from Firebase for sensor {sensor_ID}")
         return True
         
@@ -1237,7 +1074,6 @@ def xgboost_model(
     save_model: bool = True,
     retrain: bool = False
 ):
-    from xgboost import XGBRegressor 
     """Train XGBoost model and save to Firebase"""
     try:
         # Check if model already exists and we don't want to retrain
@@ -1254,7 +1090,7 @@ def xgboost_model(
                 "last_trained": metadata.get('last_trained') if metadata else None
             }
         
-        df = fetch_history(sensor_ID, range, force_fresh=True)  # Force fresh for training
+        df = fetch_history(sensor_ID, range)       
       
         if df.empty:
             return {"error": f"No data available for sensor {sensor_ID} with range {range}"}
@@ -1484,6 +1320,31 @@ def generate_sample_data():
         logger.error(f"Error generating sample data: {e}")
         return pd.DataFrame()
         
+# def convert_risk_to_aqi(risk_index):
+    # """
+    # Piecewise Linear Scaling
+    # Convert risk index to AQI (0-500 scale) 
+    # """
+    
+   ## AQI categories and their corresponding risk index ranges 
+    # aqi_thresholds = [
+        # (0, 50, 0, 3),      # Good: 0-50 AQI, 0-3 risk
+        # (51, 100, 3.1, 7),  # Moderate: 51-100 AQI, 3.1-7 risk  
+        # (101, 150, 7.1, 9), # Unhealthy for Sensitive: 101-150 AQI, 7.1-9 risk
+        # (151, 500, 9.1, 10) # Unhealthy/Very Unhealthy: 151-500 AQI, 9.1-10 risk
+    # ]
+    
+    # for aqi_min, aqi_max, risk_min, risk_max in aqi_thresholds:
+        # if risk_min <= risk_index <= risk_max:
+           # Linear interpolation within this category
+            # aqi = aqi_min + (risk_index - risk_min) * (aqi_max - aqi_min) / (risk_max - risk_min)
+            # return min(max(aqi, 0), 500)
+    
+   ## Fallback: cap at extremes
+    # if risk_index < 1:
+        # return 10
+    # else:
+        # return 500 
 # ---------------------------------------------------
 # AQI Threshold Management Functions
 # ---------------------------------------------------
@@ -1711,12 +1572,12 @@ def calculate_risk_category(risk_index):
 def get_feature_importance(sensor_id):
     """Get feature importance from trained XGBoost model"""
     try:
-        # Load the trained model from cache
+        # Load the trained model
         model = load_model_from_firebase(sensor_id)
         if not model:
             return {"error": f"No trained model found for sensor {sensor_id}"}
         
-        # Load model metadata from cache
+        # Load model metadata to get feature names
         metadata = load_model_metadata(sensor_id)
         if not metadata:
             return {"error": "Model metadata not found"}
@@ -2048,33 +1909,16 @@ def enhanced_correlation_summary(df, target_col='riskIndex'):
         return {"error": f"Failed to create correlation summary: {str(e)}"}
 
 # ---------------------------------------------------
-# API Endpoints with Error Handling and Rate Limiting
+# API Endpoints with Error Handling
 # ---------------------------------------------------
 @app.get("/api/xgboost/{sensor_id}")
 def get_xgboost_model(
-    request: Request,
     sensor_id: str,
     range: str = Query("1month", description="Date range: 1week, 1month, 3months, 6months, 1year, all"),
     save_model: bool = Query(True, description="Save trained model to Firebase"),
     retrain: bool = Query(False, description="Force retrain even if model exists")
 ):
-    try:
-        result = xgboost_model(...)
-        cleanup_memory()  # Clean up after heavy operation
-        return result
-    except Exception as e:
-        cleanup_memory()
-        raise
     """Train XGBoost model for specific sensor and optionally save to Firebase"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/xgboost/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/xgboost/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 5 minutes. Requests remaining: {remaining}"
-        )
-    
     try:
         result = xgboost_model(sensor_id, range, save_model, retrain)
         return result
@@ -2232,7 +2076,6 @@ def get_data_quality_report(
     except Exception as e:
         logger.error(f"Error in data quality report for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Data quality analysis failed: {str(e)}")
-
 import threading
 from datetime import datetime
 
@@ -2328,24 +2171,13 @@ def should_send_alert(sensor_id: str, risk_index: float) -> bool:
         return True
     
     return False
-
 @app.get("/api/alerts/{sensor_id}")
 def get_sensor_alerts(
-    request: Request,
     sensor_id: str,
     limit: int = Query(50, description="Number of alerts to return"),
     days: int = Query(7, description="Number of past days to include")
 ):
     """Get alert history for a specific sensor"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/alerts/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/alerts/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
-    
     try:
         alerts_ref = db.reference(f'/alerts/{sensor_id}')
         alerts_data = alerts_ref.order_by_child('timestamp').limit_to_last(limit).get()
@@ -2390,20 +2222,10 @@ def get_sensor_alerts(
 
 @app.get("/api/alerts")
 def get_all_alerts(
-    request: Request,
     limit: int = Query(100, description="Number of alerts to return"),
     risk_level: int = Query(None, description="Filter by risk level")
 ):
     """Get all alerts across all sensors"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/alerts", client_ip):
-        remaining = rate_limiter.get_remaining("/api/alerts", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
-    
     try:
         alerts_ref = db.reference('/alerts')
         all_alerts_data = alerts_ref.get()
@@ -2511,7 +2333,6 @@ def test_alert_saving(sensor_id: str):
         
 @app.get("/api/predict/{sensor_id}")
 def predict_risk_endpoint(
-    request: Request,
     sensor_id: str,
     methane: float = Query(..., description="Methane level"),
     co2: float = Query(..., description="CO2 level"),
@@ -2520,15 +2341,6 @@ def predict_risk_endpoint(
     temperature: float = Query(..., description="Temperature in Celsius")
 ):
     """Predict risk index using pre-trained model and send alerts if risk > 1"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/predict/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/predict/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
-    
     try:
         sensor_data = {
             "methane": methane,
@@ -2587,6 +2399,52 @@ def predict_risk_endpoint(
     except Exception as e:
         logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+# @app.get("/api/predict/{sensor_id}")
+# def predict_risk_endpoint(
+    # sensor_id: str,
+    # methane: float = Query(..., description="Methane level"),
+    # co2: float = Query(..., description="CO2 level"),
+    # ammonia: float = Query(..., description="Ammonia level"),
+    # humidity: float = Query(..., description="Humidity percentage"),
+    # temperature: float = Query(..., description="Temperature in Celsius")
+# ):
+    # """Predict risk index using pre-trained model and send alerts if risk > 1"""
+    # try:
+        # sensor_data = {
+            # "methane": methane,
+            # "co2": co2,
+            # "ammonia": ammonia,
+            # "humidity": humidity,
+            # "temperature": temperature
+        # }
+        
+        # prediction_result = predict_risk_index(sensor_id, sensor_data)
+        
+        # if "error" in prediction_result:
+            # raise HTTPException(status_code=404, detail=prediction_result["error"])
+        
+        # Enhance with AQI and risk category
+        # risk_index = prediction_result["predicted_risk_index"]
+        # aqi = convert_risk_to_aqi(risk_index)
+        # risk_level, risk_label, aqi_category, recommendation = calculate_risk_category(risk_index)
+        
+        # enhanced_result = {
+            # **prediction_result,
+            # "aqi": aqi,
+            # "aqi_category": aqi_category,
+            # "risk_level": risk_level,
+            # "risk_label": risk_label,
+            # "recommendation": recommendation,
+            # "input_data": sensor_data,  # Include input data for email alerts
+            # "timestamp": datetime.now().isoformat()
+        # }
+         
+        # return enhanced_result
+        
+    # except Exception as e:
+        # logger.error(f"Error in prediction endpoint for {sensor_id}: {e}")
+        # raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
         
 @app.post("/api/predict/{sensor_id}")
 def predict_risk_bulk(
@@ -2740,18 +2598,109 @@ def get_latest_sensor_reading(
         return {"error": f"Failed to fetch sensor readings: {str(e)}", "sensor_id": sensor_id}
  
 # ---------------------------------------------------
-# Optimized Forecast Functions
+# Health and Debug Endpoints
 # ---------------------------------------------------
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    firebase_status = "initialized" if firebase_db else "not_initialized"
+    
+    status = {
+        "status": "healthy", 
+        "message": "Dynamic XGBoost API is running",
+        "timestamp": datetime.now().isoformat(),
+        "firebase": firebase_status,
+        "fallback_data_available": True,
+        "trained_models": len(models),
+        "cached_datasets": len(data_cache),
+        "system": {
+            "python_version": os.sys.version,
+            "platform": os.sys.platform
+        }
+    }
+    return status
+
+# ---------------------------------------------------
+# Home Page
+# ---------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>Gas Monitoring API</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; background: #fafafa; }
+            h1 { color: #2c3e50; }
+            h2 { margin-top: 1.5em; color: #34495e; }
+            .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+            .status-ok { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+            .status-warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+            .status-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        </style>
+    </head>
+    <body>
+        <h1>Gas Monitoring XGBoost API</h1>
+        
+        <div class="status {'status-ok' if firebase_db else 'status-warning'}">
+            <strong>Firebase Status:</strong> {'✅ Initialized' if firebase_db else '⚠️ Not Initialized'}
+        </div>
+        
+        <p>Welcome to the <strong>Dynamic Sensor</strong> Gas Monitoring Backend with dynamic XGBoost training.</p>
+        <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
+        <p><strong>Fallback Data:</strong> ✅ Available when Firebase is unavailable</p>
+
+        <h2>API Documentation</h2>
+        <ul>
+            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
+            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
+        </ul>
+
+        <h2>Email Configuration Endpoints</h2>
+        <ul>
+            <li><code>GET /api/email-config</code> - Get current email configuration</li>
+            <li><code>POST /api/email-config/update?confirm=true</code> - Update email config with confirmation</li>
+            <li><code>POST /api/email-config/confirm-update</code> - Confirm and apply changes</li>
+            <li><code>GET /api/email-config/test-connection</code> - Test email connection</li>
+            <li><code>POST /api/test-email-alert/{sensor_id}</code> - Test email alerts</li>
+        </ul>
+
+        <h2>Main Endpoints</h2>
+        
+        <div class="endpoint">
+            <h3>🎯 Dynamic XGBoost Training & Prediction</h3>
+            <code>GET /api/xgboost/{sensor_id}?range=1month</code>
+        </div>
+
+        <div class="endpoint">
+            <h3>📊 Correlation Analysis</h3>
+            <code>GET /api/correlation_summary/{sensor_id}?range=1month&target_col=riskIndex</code><br>
+            <code>GET /api/correlations_heatmap/{sensor_id}?range=1month</code><br>
+            <code>GET /api/correlations/{sensor_id}?range=1month&target_col=riskIndex</code><br>
+            <code>GET /api/correlation_scatterplots/{sensor_id}?range=1month&target_col=riskIndex</code>
+        </div>
+
+        <hr/>
+        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI & XGBoost | Gas Monitoring Project</p>
+    </body>
+    </html>
+    """
+###  
+# Email Configuration Endpoints
+ 
+ ### Forecast Live preview
+# Add these functions to your FastAPI backend
+
 def generate_forecast(sensor_id: str, steps: int = 24):
-    """Generate future forecast using trained XGBoost model - OPTIMIZED"""
+    """Generate future forecast using trained XGBoost model - IMPROVED"""
     try:
-        # Load the trained model with caching
+        # Load the trained model
         model = load_model_from_firebase(sensor_id)
         if not model:
             logger.warning(f"No trained model found for sensor {sensor_id}, using default forecast")
             return generate_default_forecast(sensor_id, steps)
         
-        # Load model metadata with caching
+        # Load model metadata
         metadata = load_model_metadata(sensor_id)
         if not metadata:
             logger.warning(f"No metadata found for sensor {sensor_id}")
@@ -2759,7 +2708,7 @@ def generate_forecast(sensor_id: str, steps: int = 24):
         
         feature_columns = metadata.get('feature_columns', [])
         
-        # Get recent historical data for context with caching
+        # Get recent historical data for context
         df = fetch_history(sensor_id, "1week")
         if df.empty:
             logger.warning(f"No historical data for {sensor_id}, using sample data")
@@ -2934,38 +2883,19 @@ def generate_default_forecast(sensor_id: str, steps: int = 24):
     except Exception as e:
         logger.error(f"Error generating default forecast: {e}")
         return {"error": f"Forecast generation failed: {str(e)}"}
-
 def get_live_predictions(sensor_id: str):
-    """Get live predictions for the current sensor readings - OPTIMIZED"""
+    """Get live predictions for the current sensor readings"""
     try:
-        # Cache key for live readings
-        cache_key = f"{sensor_id}_live"
-        current_time = datetime.now()
+        # Get latest sensor reading
+        latest_reading_ref = db.reference(f'/sensorReadings')
+        readings_data = latest_reading_ref.order_by_child('sensorID').equal_to(sensor_id).limit_to_last(1).get()
         
-        # Check if we have recent cached live data (cache for 30 seconds)
-        if (cache_key in history_cache and 
-            cache_key in cache_expiry and
-            current_time < cache_expiry[cache_key].get('live', datetime.min)):
-            logger.info(f"Using cached live reading for {sensor_id}")
-            latest_reading = history_cache[cache_key]
-            latest_key = "cached"
-        else:
-            # Get latest sensor reading
-            latest_reading_ref = db.reference(f'/sensorReadings')
-            readings_data = latest_reading_ref.order_by_child('sensorID').equal_to(sensor_id).limit_to_last(1).get()
-            
-            if not readings_data:
-                return {"error": f"No live readings found for sensor {sensor_id}"}
-            
-            # Get the latest reading
-            latest_key = list(readings_data.keys())[0]
-            latest_reading = readings_data[latest_key]
-            
-            # Cache it
-            history_cache[cache_key] = latest_reading
-            if cache_key not in cache_expiry:
-                cache_expiry[cache_key] = {}
-            cache_expiry[cache_key]['live'] = current_time + timedelta(seconds=30)
+        if not readings_data:
+            return {"error": f"No live readings found for sensor {sensor_id}"}
+        
+        # Get the latest reading
+        latest_key = list(readings_data.keys())[0]
+        latest_reading = readings_data[latest_key]
         
         # Prepare sensor data for prediction
         sensor_data = {
@@ -2976,26 +2906,8 @@ def get_live_predictions(sensor_id: str):
             "temperature": latest_reading.get('temperature', 0)
         }
         
-        # Use cached model if available
-        model = get_cached_model(sensor_id)
-        if not model:
-            model = load_model_from_firebase(sensor_id)
-            if model:
-                cache_model(sensor_id, model)
-        
-        # Use cached metadata
-        metadata = get_cached_metadata(sensor_id)
-        if not metadata:
-            metadata = load_model_metadata(sensor_id)
-            if metadata:
-                cache_metadata(sensor_id, metadata)
-        
         # Predict risk index
-        if model and metadata:
-            prediction_result = predict_risk_index(sensor_id, sensor_data, use_regulatory_calculation=False)
-        else:
-            # Fallback to regulatory calculation
-            prediction_result = predict_risk_index(sensor_id, sensor_data, use_regulatory_calculation=True)
+        prediction_result = predict_risk_index(sensor_id, sensor_data, use_regulatory_calculation=False)
         
         if "error" in prediction_result:
             # Fallback to regulatory calculation
@@ -3005,7 +2917,6 @@ def get_live_predictions(sensor_id: str):
         prediction_result["is_live"] = True
         prediction_result["reading_timestamp"] = latest_reading.get('timestamp')
         prediction_result["sensor_reading_id"] = latest_key
-        prediction_result["from_cache"] = latest_key == "cached"  # Whether reading was from cache
         
         return prediction_result
         
@@ -3017,20 +2928,10 @@ def get_live_predictions(sensor_id: str):
 
 @app.get("/api/forecast/{sensor_id}")
 def get_forecast(
-    request: Request,
     sensor_id: str,
     steps: int = Query(24, description="Number of forecast steps (hours)", ge=1, le=168)
 ):
     """Get predictive forecast for sensor"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/forecast/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/forecast/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
-    
     try:
         result = generate_forecast(sensor_id, steps)
         if "error" in result:
@@ -3041,20 +2942,8 @@ def get_forecast(
         raise HTTPException(status_code=500, detail=f"Forecast generation failed: {str(e)}")
 
 @app.get("/api/live-predict/{sensor_id}")
-def get_live_prediction_endpoint(
-    request: Request,
-    sensor_id: str
-):
+def get_live_prediction_endpoint(sensor_id: str):
     """Get live prediction for current sensor readings"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/live-predict/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/live-predict/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
-    
     try:
         result = get_live_predictions(sensor_id)
         if "error" in result:
@@ -3064,21 +2953,72 @@ def get_live_prediction_endpoint(
         logger.error(f"Error in live prediction for {sensor_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Live prediction failed: {str(e)}")
 
-@app.get("/api/forecast/poll/{sensor_id}")
-async def poll_forecast_updates(
-    request: Request,
-    sensor_id: str
-):
-    """Polling endpoint for forecast updates - more reliable than SSE"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/forecast/poll/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/forecast/poll/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 1 minute. Requests remaining: {remaining}"
-        )
+# @app.get("/api/forecast/stream/{sensor_id}")
+# async def stream_forecast_updates(sensor_id: str):
+    # """Server-Sent Events stream for live forecast updates - FIXED CORS"""
+    # async def event_generator():
+        # while True:
+            # try:
+                ##Get latest forecast (with timeout)
+                # forecast_data = generate_forecast(sensor_id, 12)
+                # live_data = get_live_predictions(sensor_id)
+                
+                # if "error" not in forecast_data and "error" not in live_data:
+                    # data = {
+                        # "forecast": forecast_data,
+                        # "live_prediction": live_data,
+                        # "timestamp": datetime.now().isoformat(),
+                        # "type": "update"
+                    # }
+                    # yield f"data: {json.dumps(data)}\n\n"
+                # else:
+                    # error_msg = forecast_data.get('error', live_data.get('error', 'Data unavailable'))
+                    # yield f"data: {json.dumps({'error': error_msg, 'timestamp': datetime.now().isoformat()})}\n\n"
+                
+               ## Wait before next update
+                # await asyncio.sleep(30)  # Reduce to 30 seconds for better responsiveness
+                
+            # except asyncio.CancelledError:
+                # logger.info(f"SSE connection cancelled for {sensor_id}")
+                # break
+            # except Exception as e:
+                # logger.error(f"Error in forecast stream: {e}")
+                # yield f"data: {json.dumps({'error': str(e), 'timestamp': datetime.now().isoformat()})}\n\n"
+                # await asyncio.sleep(5)
     
+    # return StreamingResponse(
+        # event_generator(),
+        # media_type="text/event-stream",
+        # headers={
+            # "Cache-Control": "no-cache",
+            # "Connection": "keep-alive",
+            # "X-Accel-Buffering": "no",  # Disable buffering for nginx
+            # "Access-Control-Allow-Origin": "*",
+            # "Access-Control-Allow-Credentials": "true",
+            # "Access-Control-Expose-Headers": "*",
+            # "Content-Type": "text/event-stream; charset=utf-8"
+        # }
+    # )
+
+# #Add OPTIONS endpoint for SSE CORS preflight
+# @app.options("/api/forecast/stream/{sensor_id}")
+# async def sse_preflight(sensor_id: str):
+    # return JSONResponse(
+        # content={"status": "ok"},
+        # headers={
+            # "Access-Control-Allow-Origin": "*",
+            # "Access-Control-Allow-Methods": "GET, OPTIONS",
+            # "Access-Control-Allow-Headers": "*",
+            # "Access-Control-Max-Age": "86400",
+            # "Access-Control-Allow-Credentials": "true"
+        # }
+    # )
+ 
+# Remove or comment out the SSE endpoints and add these polling endpoints
+
+@app.get("/api/forecast/poll/{sensor_id}")
+async def poll_forecast_updates(sensor_id: str):
+    """Polling endpoint for forecast updates - more reliable than SSE"""
     try:
         # Get latest forecast
         forecast_data = generate_forecast(sensor_id, 12)
@@ -3110,10 +3050,7 @@ async def poll_forecast_updates(
         }
 
 @app.get("/api/forecast/batch/{sensor_id}")
-async def get_batch_forecast_data(
-    request: Request,
-    sensor_id: str
-):
+async def get_batch_forecast_data(sensor_id: str):
     """Get all forecast data in one request - optimized for polling"""
     try:
         # Get forecast for 24 hours
@@ -3175,25 +3112,14 @@ REPORT_TIERS = {
         "features": ["statistics", "gas_analysis", "recommendations", "executive_summary", "trend_analysis", "yearly_summary"]
     }
 }
-
 @app.get("/api/report/{sensor_id}")
 async def generate_report(
-    request: Request,
     sensor_id: str,
     from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
     report_type: str = Query("standard", description="Report type: standard (90 days), extended (180 days), annual (365 days)")
 ):
     """Generate comprehensive report data with tiered limits"""
-    # Check rate limit
-    client_ip = request.client.host if request.client else "unknown"
-    if rate_limiter.is_rate_limited("/api/report/{sensor_id}", client_ip):
-        remaining = rate_limiter.get_remaining("/api/report/{sensor_id}", client_ip)
-        raise HTTPException(
-            status_code=429, 
-            detail=f"Rate limit exceeded. Try again in 5 minutes. Requests remaining: {remaining}"
-        )
-    
     try:
         # Validate date format
         try:
@@ -3373,7 +3299,6 @@ async def generate_report(
             "error": f"Internal server error: {str(e)}",
             "sensor_id": sensor_id
         }
-
 # Helper functions
 def calculate_statistics(df):
     """Calculate statistical metrics"""
@@ -3579,7 +3504,6 @@ def get_gas_threshold(gas):
         'ammonia': 25     # ppm
     }
     return thresholds.get(gas, 0)
-
 def calculate_longest_exceedance_period(df: pd.DataFrame, gas: str, threshold: float) -> dict:
     """Calculate the longest continuous period when gas exceeded threshold"""
     try:
@@ -3988,37 +3912,6 @@ def generate_yearly_summary(df: pd.DataFrame, from_date: datetime, to_date: date
         logger.warning(f"Error generating yearly summary: {e}")
         return summary
 
-def generate_critical_events_timeline(df: pd.DataFrame) -> List[Dict]:
-    """Generate timeline of critical events from the data"""
-    critical_events = []
-    
-    try:
-        if 'riskIndex' not in df.columns or 'timestamp' not in df.columns:
-            return critical_events
-        
-        # Find high risk periods (risk > 7)
-        high_risk_mask = df['riskIndex'] > 7
-        high_risk_periods = df[high_risk_mask][['timestamp', 'riskIndex']]
-        
-        for _, row in high_risk_periods.iterrows():
-            event = {
-                "timestamp": row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
-                "risk_index": float(row['riskIndex']),
-                "aqi": float(convert_risk_to_aqi(row['riskIndex'])),
-                "category": "High Risk",
-                "description": f"Risk index reached {row['riskIndex']:.1f}"
-            }
-            critical_events.append(event)
-        
-        # Sort by timestamp (newest first)
-        critical_events.sort(key=lambda x: x['timestamp'], reverse=True)
-        
-        return critical_events[:10]  # Return top 10 critical events
-        
-    except Exception as e:
-        logger.warning(f"Error generating critical events timeline: {e}")
-        return critical_events
-
 # Helper function to get report tiers info (for frontend)
 @app.get("/api/report-tiers")
 async def get_report_tiers():
@@ -4030,228 +3923,6 @@ async def get_report_tiers():
     }
  #### End Reports Generations #####
  
-# ---------------------------------------------------
-# Cache Management Endpoints
-# ---------------------------------------------------
-@app.post("/api/cache/clear")
-def clear_cache_endpoint(sensor_id: str = None):
-    """Clear cache for specific sensor or all sensors"""
-    try:
-        if sensor_id:
-            # Clear specific sensor cache
-            keys_to_remove = [key for key in model_cache.keys() if key.startswith(sensor_id)]
-            for key in keys_to_remove:
-                model_cache.pop(key, None)
-                metadata_cache.pop(key, None)
-            
-            # Clear history cache
-            history_keys = [key for key in history_cache.keys() if key.startswith(sensor_id)]
-            for key in history_keys:
-                history_cache.pop(key, None)
-                cache_expiry.pop(key, None)
-            
-            logger.info(f"Cache cleared for sensor {sensor_id}")
-            return {"success": True, "message": f"Cache cleared for {sensor_id}"}
-        else:
-            # Clear all cache
-            model_cache.clear()
-            metadata_cache.clear()
-            history_cache.clear()
-            cache_expiry.clear()
-            logger.info("All cache cleared")
-            return {"success": True, "message": "All cache cleared"}
-    except Exception as e:
-        logger.error(f"Error clearing cache: {e}")
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/cache/stats")
-def get_cache_stats_endpoint():
-    """Get cache statistics"""
-    return {
-        "model_cache_size": len(model_cache),
-        "metadata_cache_size": len(metadata_cache),
-        "history_cache_size": len(history_cache),
-        "cache_expiry_entries": len(cache_expiry),
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/api/firebase-stats")
-def get_firebase_stats_endpoint():
-    """Get Firebase usage statistics (estimated)"""
-    try:
-        # These are estimated counts - adjust based on your actual usage
-        estimated_requests = {
-            "forecast_requests": len([k for k in history_cache.keys() if "forecast" in k]),
-            "live_predictions": len([k for k in history_cache.keys() if "live" in k]),
-            "cached_models": len(model_cache),
-            "cached_metadata": len(metadata_cache),
-            "total_cached_items": len(history_cache) + len(model_cache) + len(metadata_cache)
-        }
-        
-        return {
-            "success": True,
-            "cache_effectiveness": estimated_requests,
-            "cache_hit_ratio": f"{(estimated_requests['cached_models'] / (estimated_requests['cached_models'] + 1)) * 100:.1f}%",
-            "timestamp": datetime.now().isoformat(),
-            "recommendation": "Cache is reducing Firebase calls significantly"
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
- 
-# ---------------------------------------------------
-# Health and Debug Endpoints
-# ---------------------------------------------------
-# @app.get("/health")
-# def health_check():
-    # """Health check endpoint"""
-    # firebase_status = "initialized" if firebase_db else "not_initialized"
-    
-    # status = {
-        # "status": "healthy", 
-        # "message": "Dynamic XGBoost API is running",
-        # "timestamp": datetime.now().isoformat(),
-        # "firebase": firebase_status,
-        # "fallback_data_available": True,
-        # "trained_models": len(models),
-        # "cached_datasets": len(data_cache),
-        # "cache_stats": {
-            # "model_cache": len(model_cache),
-            # "metadata_cache": len(metadata_cache),
-            # "history_cache": len(history_cache)
-        # },
-        # "system": {
-            # "python_version": os.sys.version,
-            # "platform": os.sys.platform
-        # }
-    # }
-    # return status
-@app.get("/health")
-async def health_check():
-    """Health check with timeout"""
-    try:
-        # Simple check that doesn't timeout
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "workers": len(training_tasks) if 'training_tasks' in globals() else 0,
-            "cache_stats": {
-                "model_cache": len(model_cache),
-                "metadata_cache": len(metadata_cache)
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
-        
-# ---------------------------------------------------
-# Home Page
-# ---------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    firebase_status = "✅ Initialized" if firebase_db else "⚠️ Not Initialized"
-    cache_status = f"✅ Active ({len(model_cache)} models, {len(history_cache)} datasets cached)"
-    
-    return f"""
-    <html>
-    <head>
-        <title>Gas Monitoring API</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 2em; line-height: 1.6; background: #fafafa; }}
-            h1 {{ color: #2c3e50; }}
-            h2 {{ margin-top: 1.5em; color: #34495e; }}
-            .status {{ padding: 10px; border-radius: 5px; margin: 10px 0; }}
-            .status-ok {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
-            .status-warning {{ background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }}
-            .status-error {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
-            .endpoint {{ background: #f8f9fa; border-left: 4px solid #007bff; padding: 10px; margin: 10px 0; }}
-            code {{ background: #e9ecef; padding: 2px 4px; border-radius: 3px; }}
-        </style>
-    </head>
-    <body>
-        <h1>Gas Monitoring XGBoost API</h1>
-        
-        <div class="status {'status-ok' if firebase_db else 'status-warning'}">
-            <strong>Firebase Status:</strong> {firebase_status}
-        </div>
-        
-        <div class="status status-ok">
-            <strong>Cache Status:</strong> {cache_status}
-        </div>
-        
-        <p>Welcome to the <strong>Dynamic Sensor</strong> Gas Monitoring Backend with dynamic XGBoost training.</p>
-        <p><strong>CORS Status:</strong> ✅ Enabled for all origins</p>
-        <p><strong>Fallback Data:</strong> ✅ Available when Firebase is unavailable</p>
-
-        <h2>API Documentation</h2>
-        <ul>
-            <li><a href="/docs">Swagger UI</a> (interactive API docs)</li>
-            <li><a href="/redoc">ReDoc</a> (alternative docs)</li>
-        </ul>
-
-        <h2>Cache Management</h2>
-        <div class="endpoint">
-            <code>GET /api/cache/stats</code> - Get cache statistics<br>
-            <code>POST /api/cache/clear?sensor_id=OPTIONAL</code> - Clear cache<br>
-            <code>GET /api/firebase-stats</code> - Firebase usage stats
-        </div>
-
-        <h2>Email Configuration Endpoints</h2>
-        <ul>
-            <li><code>GET /api/email-config</code> - Get current email configuration</li>
-            <li><code>POST /api/email-config/update?confirm=true</code> - Update email config with confirmation</li>
-            <li><code>POST /api/email-config/confirm-update</code> - Confirm and apply changes</li>
-            <li><code>GET /api/email-config/test-connection</code> - Test email connection</li>
-            <li><code>POST /api/test-email-alert/{{sensor_id}}</code> - Test email alerts</li>
-        </ul>
-
-        <h2>Main Endpoints</h2>
-        
-        <div class="endpoint">
-            <h3>🎯 Dynamic XGBoost Training & Prediction</h3>
-            <code>GET /api/xgboost/{{sensor_id}}?range=1month</code>
-        </div>
-
-        <div class="endpoint">
-            <h3>📊 Correlation Analysis</h3>
-            <code>GET /api/correlation_summary/{{sensor_id}}?range=1month&target_col=riskIndex</code><br>
-            <code>GET /api/correlations_heatmap/{{sensor_id}}?range=1month</code><br>
-            <code>GET /api/correlations/{{sensor_id}}?range=1month&target_col=riskIndex</code><br>
-            <code>GET /api/correlation_scatterplots/{{sensor_id}}?range=1month&target_col=riskIndex</code>
-        </div>
-
-        <div class="endpoint">
-            <h3>🔮 Forecasting & Live Predictions</h3>
-            <code>GET /api/forecast/{{sensor_id}}?steps=24</code><br>
-            <code>GET /api/live-predict/{{sensor_id}}</code><br>
-            <code>GET /api/forecast/poll/{{sensor_id}}</code><br>
-            <code>GET /api/forecast/batch/{{sensor_id}}</code>
-        </div>
-
-        <div class="endpoint">
-            <h3>📈 Reports Generation</h3>
-            <code>GET /api/report/{{sensor_id}}?from_date=YYYY-MM-DD&to_date=YYYY-MM-DD&report_type=standard</code><br>
-            <code>GET /api/report-tiers</code>
-        </div>
-
-        <hr/>
-        <p style="font-size: 0.9em; color: #666;">Powered by FastAPI & XGBoost | Gas Monitoring Project | Caching Optimized</p>
-    </body>
-    </html>
-    """
-###  
-# Email Configuration Endpoints
-
-def cleanup_memory():
-    """Force garbage collection"""
-    gc.collect()
-    
-    # Clear matplotlib figures
-    import matplotlib.pyplot as plt
-    plt.close('all')
-    
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
